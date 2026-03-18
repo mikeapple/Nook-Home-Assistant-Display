@@ -15,6 +15,7 @@ Old Nook e-readers are surprisingly perfect for always-on dashboards:
 
 This project turns one into a **real-time Home Assistant energy display**.
 
+
 ---
 
 ## 🔓 Rooting the Nook
@@ -127,11 +128,11 @@ This is the key trick that makes it usable on old hardware.
 
 ### 🧰 Designer UI
 
-![Designer Screen](designerScreen.png)
+![Designer Screen](images/designerScreen.png)
 
 ### 📟 Nook Display
 
-![Nook Screen](nookScreen.png)
+![Nook Screen](images/nookScreen.jpg)
 
 ---
 
