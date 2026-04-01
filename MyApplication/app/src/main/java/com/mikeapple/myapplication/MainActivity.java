@@ -3,6 +3,7 @@ package com.mikeapple.myapplication;
 import android.app.Activity;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.Looper;
 import android.view.WindowManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -18,16 +19,27 @@ import java.util.Locale;
 import android.util.Log;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileWriter;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URL;
+import java.io.FileInputStream;
+import java.io.OutputStream;
 
+// read log adb shell run-as com.mikeapple.myapplication cat files/refresh_trace.log
 public class MainActivity extends Activity {
 
     private static final String TAG = "EnergyDashboard";
+    private static final String LOG_FILE_NAME = "refresh_trace.log";
+    private static final long LOG_FILE_MAX_BYTES = 1024 * 1024; // 1 MB
     private WebView webView;
-    private Handler handler = new Handler();
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private boolean refreshScheduled = false;
+    private ServerSocket logServerSocket;
 
     // Toggle between JavaScript auto-refresh and Java injection
     // true = JavaScript handles updates (may cause e-ink flashing)
@@ -53,7 +65,7 @@ public class MainActivity extends Activity {
 
     // Home Assistant Configuration
     private static final String HA_BASE_URL = "http://192.168.0.180:8123";
-    private static final String HA_TOKEN = "..-"; // Replace with your actual long-lived access token from Home Assistant
+    private static final String HA_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI3MmJhYWRlOWI5YzY0MTA3YjQzYmQ1YzAxZTdkYTdkYyIsImlhdCI6MTc3MzY1NzU0OCwiZXhwIjoyMDg5MDE3NTQ4fQ.X_psjXXzLfiMDRkur8Xg32vn6B0-Dus_9jcLwJmvZ_w";
 
     // Home Assistant Entity IDs
     private static final String ENTITY_PV1_POWER = "sensor.solarsynkv3_2212102484_pv_mppt0_power";
@@ -107,6 +119,9 @@ public class MainActivity extends Activity {
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // Enable ADB over TCP on port 5555 for remote debugging
+        enableAdbOverTcp();
+
         getWindow().setFlags(
                 WindowManager.LayoutParams.FLAG_FULLSCREEN,
                 WindowManager.LayoutParams.FLAG_FULLSCREEN
@@ -135,36 +150,122 @@ public class MainActivity extends Activity {
 
         webView.loadDataWithBaseURL("file:///android_asset/", html, "text/html", "UTF-8", null);
         Log.d(TAG, "WebView loaded, USE_JS_REFRESH=" + USE_JS_REFRESH);
+        logEvent("INFO", "MainActivity created; WebView initialized");
+        logEvent("INFO", "File logging enabled at " + new File(getFilesDir(), LOG_FILE_NAME).getAbsolutePath());
+        startLogServer();
     }
 
-    private Runnable refreshRunnable = new Runnable() {
+    private final Runnable refreshRunnable = new Runnable() {
         public void run() {
+            refreshScheduled = false;
+            logEvent("INFO", "refreshRunnable invoked on thread=" + Thread.currentThread().getName() + ", USE_JS_REFRESH=" + USE_JS_REFRESH);
             if (!USE_JS_REFRESH) {
-                Log.d(TAG, "Refresh cycle starting");
+                logEvent("INFO", "Refresh cycle starting");
                 fetchAndUpdate();
             }
         }
     };
 
+    private void scheduleRefresh(long delayMs, String reason) {
+        handler.removeCallbacks(refreshRunnable);
+        refreshScheduled = true;
+        logEvent("INFO", "Scheduling refresh in " + delayMs + " ms; reason=" + reason);
+        handler.postDelayed(refreshRunnable, delayMs);
+    }
+
+    private void cancelRefresh(String reason) {
+        if (refreshScheduled) {
+            logEvent("INFO", "Cancelling scheduled refresh; reason=" + reason);
+        }
+        handler.removeCallbacks(refreshRunnable);
+        refreshScheduled = false;
+    }
+
+    /**
+     * Enables ADB over TCP on port 5555 for remote debugging.
+     * Requires root access on the device.
+     */
+    private void enableAdbOverTcp() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Log.d(TAG, "Attempting to enable ADB over TCP on port 5555");
+                    
+                    // Execute commands as root to enable ADB over TCP
+                    executeRootCommand("setprop service.adb.tcp.port 5555");
+                    executeRootCommand("stop adbd");
+                    executeRootCommand("start adbd");
+                    
+                    Log.d(TAG, "ADB over TCP enabled on port 5555");
+                    logEvent("INFO", "ADB over TCP enabled on port 5555");
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to enable ADB over TCP", e);
+                    logEvent("ERROR", "Failed to enable ADB over TCP: " + e.getMessage());
+                }
+            }
+        }).start();
+    }
+
+    /**
+     * Executes a command with root privileges.
+     * @param command The command to execute
+     */
+    private void executeRootCommand(String command) throws Exception {
+        Process process = null;
+        try {
+            process = Runtime.getRuntime().exec("su");
+            OutputStream os = process.getOutputStream();
+            os.write((command + "\n").getBytes());
+            os.write("exit\n".getBytes());
+            os.flush();
+            os.close();
+            
+            process.waitFor();
+            
+            // Read output for debugging
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                Log.d(TAG, "Root command output: " + line);
+            }
+            reader.close();
+            
+            // Read error stream
+            BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+            while ((line = errorReader.readLine()) != null) {
+                Log.e(TAG, "Root command error: " + line);
+            }
+            errorReader.close();
+            
+        } finally {
+            if (process != null) {
+                process.destroy();
+            }
+        }
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
         if (!USE_JS_REFRESH) {
-            Log.d(TAG, "onResume: Starting initial load in 3 seconds");
-            handler.postDelayed(refreshRunnable, 3000);
+            scheduleRefresh(3000, "onResume initial refresh");
         }
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        handler.removeCallbacks(refreshRunnable);
+        cancelRefresh("onPause");
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        handler.removeCallbacks(refreshRunnable);
+        cancelRefresh("onDestroy");
+        if (logServerSocket != null && !logServerSocket.isClosed()) {
+            try { logServerSocket.close(); } catch (Exception ignored) {}
+        }
     }
 
     @Override
@@ -176,12 +277,13 @@ public class MainActivity extends Activity {
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (webView != null) {
             webView.reload();   // full page reload
+            logEvent("INFO", "Key press detected: forced WebView reload");
         }
         return true; // consume the key
     }
 
     private void fetchAndUpdate() {
-        Log.d(TAG, "fetchAndUpdate: Fetching HA states");
+        logEvent("INFO", "fetchAndUpdate: requesting Home Assistant states");
         Thread t = new Thread(new Runnable() {
             public void run() {
                 HttpURLConnection conn = null;
@@ -197,13 +299,13 @@ public class MainActivity extends Activity {
 
                     int code = conn.getResponseCode();
                     if (code < 200 || code >= 300) {
-                        Log.e(TAG, "HTTP error: " + code);
+                        logEvent("ERROR", "Home Assistant request failed with HTTP " + code);
                         return;
                     }
 
                     String body = readAll(conn.getInputStream());
                     final JSONArray states = new JSONArray(body);
-                    Log.d(TAG, "Fetched " + states.length() + " entities from HA");
+                    logEvent("INFO", "Home Assistant states fetched successfully; entity count=" + states.length());
 
                     // Build index of entities
                     final HashMap<String, JSONObject> entityIndex = new HashMap<String, JSONObject>();
@@ -220,22 +322,26 @@ public class MainActivity extends Activity {
                     runOnUiThread(new Runnable() {
                         public void run() {
                             if (isInitialLoad) {
-                                Log.d(TAG, "Initial load: Injecting all entities at once");
+                                logEvent("INFO", "Initial load: injecting all configured entities");
                                 processAndInjectAllData(entityIndex);
                                 isInitialLoad = false;
                                 // Schedule next update after REFRESH_INTERVAL
-                                Log.d(TAG, "Scheduling next update in " + (REFRESH_INTERVAL/1000) + " seconds");
-                                handler.postDelayed(refreshRunnable, REFRESH_INTERVAL);
+                                logEvent("INFO", "Initial load complete; scheduling next refresh in " + (REFRESH_INTERVAL/1000) + " seconds");
+                                scheduleRefresh(REFRESH_INTERVAL, "initial load complete");
                             } else {
-                                Log.d(TAG, "Starting group-based update cycle");
+                                logEvent("INFO", "Starting staggered group update cycle");
                                 applyGroupsSequentially(entityIndex, 1);
                             }
                         }
                     });
 
-                } catch (Exception e) {
-                    Log.e(TAG, "Error fetching data: " + e.getMessage());
-                    e.printStackTrace();
+                } catch (final Exception e) {
+                    logEvent("ERROR", "Exception while fetching/updating states", e);
+                    runOnUiThread(new Runnable() {
+                        public void run() {
+                            scheduleRefresh(REFRESH_INTERVAL, "retry after error: " + e.getClass().getSimpleName());
+                        }
+                    });
                 } finally {
                     if (conn != null) {
                         conn.disconnect();
@@ -249,7 +355,7 @@ public class MainActivity extends Activity {
     // Apply all entities at once (for initial load)
     private void processAndInjectAllData(HashMap<String, JSONObject> index) {
         try {
-            Log.d(TAG, "Injecting all entities");
+            logEvent("INFO", "Injecting all entity groups in a single pass");
             // Inject all entities from all groups
             for (HashMap.Entry<Integer, String[]> entry : ENTITY_GROUPS.entrySet()) {
                 String[] entities = entry.getValue();
@@ -262,10 +368,10 @@ public class MainActivity extends Activity {
             SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss", Locale.US);
             String timestamp = sdf.format(new Date());
             setText("statusText", "Loaded " + timestamp);
-            Log.d(TAG, "All entities injected");
+            logEvent("INFO", "Initial entity injection completed");
 
         } catch (Exception e) {
-            Log.e(TAG, "Error in processAndInjectAllData: " + e.getMessage());
+            logEvent("ERROR", "Error during initial entity injection", e);
         }
     }
 
@@ -273,20 +379,20 @@ public class MainActivity extends Activity {
     private void applyGroupsSequentially(final HashMap<String, JSONObject> index, final int groupNum) {
         if (!ENTITY_GROUPS.containsKey(groupNum)) {
             // All groups done, schedule next refresh
-            Log.d(TAG, "All groups applied, scheduling next refresh in " + (REFRESH_INTERVAL/1000) + " seconds");
+            logEvent("INFO", "All groups applied; scheduling next refresh in " + (REFRESH_INTERVAL/1000) + " seconds");
             SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss", Locale.US);
             String timestamp = sdf.format(new Date());
             setText("statusText", "Updated " + timestamp);
-            handler.postDelayed(refreshRunnable, REFRESH_INTERVAL);
+            scheduleRefresh(REFRESH_INTERVAL, "group cycle complete");
             return;
         }
 
-        Log.d(TAG, "Applying group " + groupNum);
+        logEvent("INFO", "Applying entity group " + groupNum);
         String[] entities = ENTITY_GROUPS.get(groupNum);
         for (String entityId : entities) {
             injectEntityValue(index, entityId);
         }
-        Log.d(TAG, "Group " + groupNum + " applied (" + entities.length + " entities)");
+        logEvent("INFO", "Group " + groupNum + " applied; entity count=" + entities.length);
 
         // Schedule next group
         handler.postDelayed(new Runnable() {
@@ -299,13 +405,13 @@ public class MainActivity extends Activity {
     private void injectEntityValue(HashMap<String, JSONObject> index, String entityId) {
         JSONObject entity = index.get(entityId);
         if (entity == null) {
-            Log.w(TAG, "Entity not found: " + entityId);
+            logEvent("WARN", "Configured entity missing from response: " + entityId);
             return;
         }
 
         String state = entity.optString("state");
         if (state == null || state.equals("unknown") || state.equals("unavailable")) {
-            Log.w(TAG, "Entity " + entityId + " has invalid state: " + state);
+            logEvent("WARN", "Entity skipped due to unavailable/unknown state: " + entityId);
             return;
         }
 
@@ -316,7 +422,7 @@ public class MainActivity extends Activity {
         String value = formatEntityValue(entityId, state, entity, false);
 
         setText(elementId, value);
-        Log.d(TAG, "Injected " + entityId + " = " + value);
+        logEvent("INFO", "Updated UI element for entity: " + entityId);
 
         // For grid export, also update the formatted element with _25 suffix
         if (entityId.equals("sensor.solarsynkv3_2212102484_grid_etoday_to")) {
@@ -324,7 +430,7 @@ public class MainActivity extends Activity {
 
             String originalValue = formatEntityValue(entityId, state, entity, true);
             setText(elementId, originalValue);
-            Log.d(TAG, "Also injected formatted element: " + elementId + "_25");
+            logEvent("INFO", "Updated alternate display element for grid export");
         }
     }
 
@@ -336,7 +442,7 @@ public class MainActivity extends Activity {
                 double cost = Double.parseDouble(state);
                 return String.format("£%.2f", cost);
             } catch (NumberFormatException e) {
-                Log.w(TAG, "Failed to parse cost value: " + state);
+                logEvent("WARN", "Failed to parse cost value", e);
                 return state;
             }
         }
@@ -348,7 +454,7 @@ public class MainActivity extends Activity {
                 double pence = kwh * 0.12;
                 return String.format("£%.2f", pence);
             } catch (NumberFormatException e) {
-                Log.w(TAG, "Failed to parse kWh value: " + state);
+                logEvent("WARN", "Failed to parse grid export value", e);
                 return state;
             }
         }
@@ -367,7 +473,7 @@ public class MainActivity extends Activity {
                 double kilowatts = watts / 1000.0;
                 return String.format("%.2f kW", kilowatts);
             } catch (NumberFormatException e) {
-                Log.w(TAG, "Failed to parse watts value: " + state);
+                logEvent("WARN", "Failed to parse power value", e);
                 // Fall through to default formatting
             }
         }
@@ -408,5 +514,111 @@ public class MainActivity extends Activity {
         s = s.replace("\\", "\\\\");
         s = s.replace("'", "\\'");
         return s;
+    }
+
+    private void startLogServer() {
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    logServerSocket = new ServerSocket(8080);
+                    logEvent("INFO", "Log server started on port 8080");
+                    while (!logServerSocket.isClosed()) {
+                        try {
+                            Socket client = logServerSocket.accept();
+                            serveLogRequest(client);
+                        } catch (Exception e) {
+                            if (!logServerSocket.isClosed()) {
+                                logEvent("ERROR", "Log server accept error", e);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    logEvent("ERROR", "Failed to start log server", e);
+                }
+            }
+        }).start();
+    }
+
+    private void serveLogRequest(Socket client) {
+        try {
+            // Drain the HTTP request
+            InputStream in = client.getInputStream();
+            byte[] reqBuf = new byte[4096];
+            in.read(reqBuf);
+
+            File logFile = new File(getFilesDir(), LOG_FILE_NAME);
+            byte[] bodyBytes;
+            if (logFile.exists()) {
+                FileInputStream fis = new FileInputStream(logFile);
+                bodyBytes = new byte[(int) logFile.length()];
+                fis.read(bodyBytes);
+                fis.close();
+            } else {
+                bodyBytes = "(log file not found)".getBytes("UTF-8");
+            }
+
+            OutputStream out = client.getOutputStream();
+            String header = "HTTP/1.0 200 OK\r\n"
+                    + "Content-Type: text/plain; charset=UTF-8\r\n"
+                    + "Content-Length: " + bodyBytes.length + "\r\n"
+                    + "Connection: close\r\n"
+                    + "\r\n";
+            out.write(header.getBytes("UTF-8"));
+            out.write(bodyBytes);
+            out.flush();
+        } catch (Exception e) {
+            logEvent("ERROR", "Error serving log request", e);
+        } finally {
+            try { client.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void logEvent(String level, String message) {
+        logEvent(level, message, null);
+    }
+
+    private synchronized void logEvent(String level, String message, Throwable throwable) {
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
+        String line = timestamp + " [" + level + "] " + message;
+
+        if ("ERROR".equals(level)) {
+            if (throwable != null) {
+                Log.e(TAG, message, throwable);
+            } else {
+                Log.e(TAG, message);
+            }
+        } else if ("WARN".equals(level)) {
+            if (throwable != null) {
+                Log.w(TAG, message, throwable);
+            } else {
+                Log.w(TAG, message);
+            }
+        } else {
+            Log.d(TAG, message);
+        }
+
+        File logFile = new File(getFilesDir(), LOG_FILE_NAME);
+        try {
+            rotateLogIfNeeded(logFile);
+            FileWriter writer = new FileWriter(logFile, true);
+            writer.write(line);
+            if (throwable != null) {
+                writer.write(" | " + throwable.getClass().getSimpleName() + ": " + String.valueOf(throwable.getMessage()));
+            }
+            writer.write("\n");
+            writer.close();
+        } catch (Exception ioe) {
+            Log.e(TAG, "Failed to write log file", ioe);
+        }
+    }
+
+    private void rotateLogIfNeeded(File logFile) {
+        if (logFile.exists() && logFile.length() >= LOG_FILE_MAX_BYTES) {
+            File backup = new File(getFilesDir(), LOG_FILE_NAME + ".1");
+            if (backup.exists()) {
+                backup.delete();
+            }
+            logFile.renameTo(backup);
+        }
     }
 }
